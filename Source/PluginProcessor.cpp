@@ -1,169 +1,317 @@
-#include "PluginProcessor.h"
+
 #include "PluginEditor.h"
+#include <random>
 
-VocalfireAudioProcessor::VocalfireAudioProcessor()
-    : AudioProcessor(BusesProperties()
-        .withInput("Input", juce::AudioChannelSet::stereo(), true)
-        .withOutput("Output", juce::AudioChannelSet::stereo(), true)),
-      parameters(*this, nullptr, "VOCALFIRE_STATE", createParameterLayout())
+namespace
 {
-}
-
-juce::AudioProcessorValueTreeState::ParameterLayout VocalfireAudioProcessor::createParameterLayout()
-{
-    using APF = juce::AudioParameterFloat;
-    using APC = juce::AudioParameterChoice;
-    juce::AudioProcessorValueTreeState::ParameterLayout p;
-    p.add(std::make_unique<APF>("input", "Input", juce::NormalisableRange<float>(-24.f, 12.f, .1f), 0.f));
-    p.add(std::make_unique<APF>("output", "Output", juce::NormalisableRange<float>(-24.f, 12.f, .1f), 0.f));
-    p.add(std::make_unique<APF>("reverb", "Reverb", juce::NormalisableRange<float>(0.f, 100.f, 1.f), 12.f));
-    p.add(std::make_unique<APF>("delay", "Delay", juce::NormalisableRange<float>(0.f, 100.f, 1.f), 0.f));
-    p.add(std::make_unique<APF>("feedback", "Feedback", juce::NormalisableRange<float>(0.f, 90.f, 1.f), 25.f));
-    p.add(std::make_unique<APF>("cutoff", "Low Cut", juce::NormalisableRange<float>(40.f, 250.f, 1.f), 85.f));
-    p.add(std::make_unique<APF>("distortion", "Distortion", juce::NormalisableRange<float>(0.f, 100.f, 1.f), 0.f));
-    p.add(std::make_unique<APF>("pitch", "Pitch Monitor", juce::NormalisableRange<float>(0.f, 100.f, 1.f), 0.f));
-    p.add(std::make_unique<APC>("key", "Key", juce::StringArray { "C","C#","D","D#","E","F","F#","G","G#","A","A#","B" }, 0));
-    p.add(std::make_unique<APC>("scale", "Scale", juce::StringArray { "Chromatic","Major","Minor" }, 2));
-    return p;
-}
-
-void VocalfireAudioProcessor::prepareToPlay(double sr, int)
-{
-    currentSampleRate = sr;
-    juce::dsp::ProcessSpec spec { sr, 512, (juce::uint32)getTotalNumOutputChannels() };
-    reverb.reset();
-    juce::dsp::Reverb::Parameters rp;
-    rp.roomSize = 0.55f; rp.damping = 0.45f; rp.wetLevel = 0.0f; rp.dryLevel = 1.0f; rp.width = 1.0f;
-    reverb.setParameters(rp);
-    delay.prepare(spec);
-    delay.setDelay(juce::jlimit(1.0f, 191999.0f, (float)(sr * 0.375)));
-    delay.reset();
-    auto coeff = juce::dsp::IIR::Coefficients<float>::makeHighPass(sr, 85.0);
-    *lowCutL.coefficients = *coeff;
-    *lowCutR.coefficients = *coeff;
-    lowCutL.reset(); lowCutR.reset();
-    monoAnalysis.setSize(1, 2048);
-}
-
-void VocalfireAudioProcessor::releaseResources() {}
-
-bool VocalfireAudioProcessor::isBusesLayoutSupported(const BusesLayout& layouts) const
-{
-    const auto in = layouts.getMainInputChannelSet();
-    const auto out = layouts.getMainOutputChannelSet();
-    return (in == juce::AudioChannelSet::mono() || in == juce::AudioChannelSet::stereo()) && in == out;
-}
-
-void VocalfireAudioProcessor::analysePitch(const juce::AudioBuffer<float>& b)
-{
-    const int n = juce::jmin(2048, b.getNumSamples());
-    if (n < 512) return;
-    auto* x = monoAnalysis.getWritePointer(0);
-    for (int i = 0; i < n; ++i)
+    struct VocalPreset
     {
-        float s = b.getSample(0, i);
-        if (b.getNumChannels() > 1) s = 0.5f * (s + b.getSample(1, i));
-        x[i] = s;
+        const char* name;
+        float input;
+        float output;
+        float distortion;
+        float reverb;
+        float delay;
+        float feedback;
+        float cutoff;
+        int key;
+        int scale;
+    };
+
+    const VocalPreset presets[] =
+    {
+        { "VILLIAN // DARK TRAP",       2.0f, -1.0f, 34.0f, 10.0f,  8.0f, 28.0f, 105.0f,  2, 2 },
+        { "FORTUNA812 // SPACE",        1.0f, -1.5f, 18.0f, 38.0f, 24.0f, 36.0f,  95.0f,  9, 2 },
+        { "MAYOT // MELODIC",           1.5f, -1.0f, 12.0f, 22.0f, 16.0f, 24.0f,  90.0f,  4, 2 },
+        { "OG BUDA // WARM",            2.5f, -2.0f, 28.0f, 14.0f,  5.0f, 20.0f, 115.0f,  7, 2 },
+        { "9MICE // BRIGHT",            0.0f, -1.0f, 22.0f, 28.0f, 20.0f, 32.0f, 130.0f,  1, 2 },
+        { "DARK PRINCE // LOW",         3.0f, -2.5f, 42.0f,  8.0f,  4.0f, 18.0f,  75.0f,  5, 2 },
+        { "ANONYMUS EMBER // AMBIENT",  0.5f, -2.0f, 15.0f, 52.0f, 32.0f, 42.0f, 100.0f,  8, 2 },
+        { "MADK1D // EDGE",             2.0f, -1.0f, 48.0f, 12.0f, 12.0f, 30.0f, 120.0f, 10, 2 }
+    };
+
+    constexpr int presetCount = sizeof(presets) / sizeof(presets[0]);
+
+    void styleSlider(juce::Slider& slider, const juce::String& name)
+    {
+        slider.setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
+        slider.setTextBoxStyle(juce::Slider::TextBoxBelow, false, 65, 20);
+        slider.setName(name);
+        slider.setColour(juce::Slider::rotarySliderFillColourId,
+                         juce::Colour(0xffa855f7));
+        slider.setColour(juce::Slider::rotarySliderOutlineColourId,
+                         juce::Colour(0xff302044));
+        slider.setColour(juce::Slider::thumbColourId,
+                         juce::Colour(0xffe9d5ff));
+        slider.setColour(juce::Slider::textBoxTextColourId,
+                         juce::Colours::white);
+        slider.setColour(juce::Slider::textBoxBackgroundColourId,
+                         juce::Colour(0xff171020));
+        slider.setColour(juce::Slider::textBoxOutlineColourId,
+                         juce::Colour(0xff51316e));
     }
-    const int minLag = juce::jmax(2, (int)(currentSampleRate / 1000.0));
-    const int maxLag = juce::jmin(n / 2, (int)(currentSampleRate / 65.0));
-    float best = 0.f;
-    int bestLag = 0;
-    for (int lag = minLag; lag <= maxLag; ++lag)
+}
+
+VocalfireAudioProcessorEditor::VocalfireAudioProcessorEditor(
+    VocalfireAudioProcessor& p)
+    : AudioProcessorEditor(&p), audioProcessor(p)
+{
+    setSize(760, 520);
+
+    auto& params = audioProcessor.parameters;
+
+    auto setupButton = [](juce::TextButton& button)
     {
-        double corr = 0.0, e1 = 0.0, e2 = 0.0;
-        for (int i = 0; i < n - lag; i += 2)
+        button.setColour(juce::TextButton::buttonColourId,
+                         juce::Colour(0xff28143d));
+        button.setColour(juce::TextButton::buttonOnColourId,
+                         juce::Colour(0xff7135a8));
+        button.setColour(juce::TextButton::textColourOffId,
+                         juce::Colours::white);
+        button.setColour(juce::TextButton::textColourOnId,
+                         juce::Colours::white);
+    };
+
+    for (int i = 0; i < presetCount; ++i)
+        presetBox.addItem(presets[i].name, i + 1);
+
+    presetBox.setSelectedId(1);
+    presetBox.setColour(juce::ComboBox::backgroundColourId,
+                        juce::Colour(0xff171020));
+    presetBox.setColour(juce::ComboBox::textColourId,
+                        juce::Colours::white);
+    presetBox.setColour(juce::ComboBox::outlineColourId,
+                        juce::Colour(0xff7135a8));
+
+    addAndMakeVisible(presetBox);
+    presetBox.onChange = [this]
+    {
+        applyPreset(presetBox.getSelectedId() - 1);
+    };
+
+    setupButton(randomButton);
+    setupButton(saveButton);
+    setupButton(loadButton);
+
+    addAndMakeVisible(randomButton);
+    addAndMakeVisible(saveButton);
+    addAndMakeVisible(loadButton);
+
+    randomButton.onClick = [this] { randomPreset(); };
+    saveButton.onClick = [this] { savePreset(); };
+    loadButton.onClick = [this] { loadPreset(); };
+
+    styleSlider(inputSlider, "INPUT");
+    styleSlider(outputSlider, "OUTPUT");
+    styleSlider(distortionSlider, "DISTORTION");
+    styleSlider(reverbSlider, "REVERB");
+    styleSlider(delaySlider, "DELAY");
+    styleSlider(feedbackSlider, "FEEDBACK");
+    styleSlider(cutoffSlider, "LOW CUT");
+
+    addAndMakeVisible(inputSlider);
+    addAndMakeVisible(outputSlider);
+    addAndMakeVisible(distortionSlider);
+    addAndMakeVisible(reverbSlider);
+    addAndMakeVisible(delaySlider);
+    addAndMakeVisible(feedbackSlider);
+    addAndMakeVisible(cutoffSlider);
+
+    inputAttachment =
+        std::make_unique<SliderAttachment>(params, "input", inputSlider);
+    outputAttachment =
+        std::make_unique<SliderAttachment>(params, "output", outputSlider);
+    distortionAttachment =
+        std::make_unique<SliderAttachment>(params, "distortion", distortionSlider);
+    reverbAttachment =
+        std::make_unique<SliderAttachment>(params, "reverb", reverbSlider);
+    delayAttachment =
+        std::make_unique<SliderAttachment>(params, "delay", delaySlider);
+    feedbackAttachment =
+        std::make_unique<SliderAttachment>(params, "feedback", feedbackSlider);
+    cutoffAttachment =
+        std::make_unique<SliderAttachment>(params, "cutoff", cutoffSlider);
+
+    keyBox.addItem("C", 1);
+    keyBox.addItem("C#", 2);
+    keyBox.addItem("D", 3);
+    keyBox.addItem("D#", 4);
+    keyBox.addItem("E", 5);
+    keyBox.addItem("F", 6);
+    keyBox.addItem("F#", 7);
+    keyBox.addItem("G", 8);
+    keyBox.addItem("G#", 9);
+    keyBox.addItem("A", 10);
+    keyBox.addItem("A#", 11);
+    keyBox.addItem("B", 12);
+
+    scaleBox.addItem("Major", 1);
+    scaleBox.addItem("Minor", 2);
+    scaleBox.addItem("Harmonic Minor", 3);
+
+    addAndMakeVisible(keyBox);
+    addAndMakeVisible(scaleBox);
+
+    keyAttachment =
+        std::make_unique<ComboAttachment>(params, "key", keyBox);
+    scaleAttachment =
+        std::make_unique<ComboAttachment>(params, "scale", scaleBox);
+
+    keyBox.setColour(juce::ComboBox::backgroundColourId,
+                     juce::Colour(0xff171020));
+    keyBox.setColour(juce::ComboBox::textColourId, juce::Colours::white);
+    scaleBox.setColour(juce::ComboBox::backgroundColourId,
+                       juce::Colour(0xff171020));
+    scaleBox.setColour(juce::ComboBox::textColourId, juce::Colours::white);
+}
+
+VocalfireAudioProcessorEditor::~VocalfireAudioProcessorEditor()
+{
+}
+
+void VocalfireAudioProcessorEditor::applyPreset(int presetIndex)
+{
+    if (presetIndex < 0 || presetIndex >= presetCount)
+        return;
+
+    const auto& preset = presets[presetIndex];
+    auto& params = audioProcessor.parameters;
+
+    auto setParameter = [&params](const char* id, float value)
+    {
+        if (auto* parameter = params.getParameter(id))
         {
-            const float a = x[i], c = x[i + lag];
-            corr += a * c; e1 += a * a; e2 += c * c;
+            const float normalized =
+                parameter->convertTo0to1(value);
+
+            parameter->setValueNotifyingHost(normalized);
         }
-        const float score = (float)(corr / std::sqrt(e1 * e2 + 1.0e-12));
-        if (score > best) { best = score; bestLag = lag; }
-    }
-    if (bestLag > 0 && best > 0.55f)
+    };
+
+    setParameter("input", preset.input);
+    setParameter("output", preset.output);
+    setParameter("distortion", preset.distortion);
+    setParameter("reverb", preset.reverb);
+    setParameter("delay", preset.delay);
+    setParameter("feedback", preset.feedback);
+    setParameter("cutoff", preset.cutoff);
+
+    // Choice parameters use normalized values.
+    if (auto* key = params.getParameter("key"))
+        key->setValueNotifyingHost(static_cast<float>(preset.key) / 11.0f);
+
+    if (auto* scale = params.getParameter("scale"))
+        scale->setValueNotifyingHost(static_cast<float>(preset.scale) / 2.0f);
+}
+
+void VocalfireAudioProcessorEditor::randomPreset()
+{
+    static std::mt19937 randomEngine { std::random_device{}() };
+    std::uniform_int_distribution<int> distribution(0, presetCount - 1);
+
+    const int index = distribution(randomEngine);
+    presetBox.setSelectedId(index + 1, juce::sendNotification);
+    applyPreset(index);
+}
+
+void VocalfireAudioProcessorEditor::savePreset()
+{
+    juce::FileChooser chooser(
+        "Save VOCALFIRE preset",
+        juce::File::getSpecialLocation(juce::File::userDocumentsDirectory)
+            .getChildFile("My VOCALFIRE Preset.vocalfire"),
+        "*.vocalfire");
+
+    if (chooser.browseForFileToSave(true))
     {
-        const float hz = (float)currentSampleRate / (float)bestLag;
-        const float midi = 69.f + 12.f * std::log2(hz / 440.f);
-        detectedHz.store(hz);
-        detectedNote.store(midi);
+        auto state = audioProcessor.parameters.copyState();
+        std::unique_ptr<juce::XmlElement> xml(state.createXml());
+
+        if (xml != nullptr)
+            xml->writeTo(chooser.getResult());
     }
 }
 
-void VocalfireAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer&)
+void VocalfireAudioProcessorEditor::loadPreset()
 {
-    juce::ScopedNoDenormals noDenormals;
-    const int channels = getTotalNumOutputChannels();
-    for (int ch = getTotalNumInputChannels(); ch < channels; ++ch)
-        buffer.clear(ch, 0, buffer.getNumSamples());
+    juce::FileChooser chooser(
+        "Load VOCALFIRE preset",
+        juce::File::getSpecialLocation(juce::File::userDocumentsDirectory),
+        "*.vocalfire");
 
-    analysePitch(buffer);
-    const float inGain = juce::Decibels::decibelsToGain(parameters.getRawParameterValue("input")->load());
-    const float outGain = juce::Decibels::decibelsToGain(parameters.getRawParameterValue("output")->load());
-    const float rv = parameters.getRawParameterValue("reverb")->load() / 100.f;
-    const float dl = parameters.getRawParameterValue("delay")->load() / 100.f;
-    const float fb = parameters.getRawParameterValue("feedback")->load() / 100.f;
-    const float cut = parameters.getRawParameterValue("cutoff")->load();
-    const float distortionAmount = parameters.getRawParameterValue("distortion")->load() / 100.f;
-
-    auto coeff = juce::dsp::IIR::Coefficients<float>::makeHighPass(currentSampleRate, cut);
-    *lowCutL.coefficients = *coeff;
-    *lowCutR.coefficients = *coeff;
-
-    const float drive = 1.0f + distortionAmount * 18.0f;
-    const float normaliser = std::tanh(drive);
-
-    for (int ch = 0; ch < buffer.getNumChannels(); ++ch)
+    if (chooser.browseForFileToOpen())
     {
-        auto* data = buffer.getWritePointer(ch);
-        auto& filter = (ch == 0 ? lowCutL : lowCutR);
-        for (int i = 0; i < buffer.getNumSamples(); ++i)
+        auto xml = juce::XmlDocument::parse(chooser.getResult());
+
+        if (xml != nullptr)
         {
-            float dry = filter.processSample(data[i] * inGain);
+            auto state = juce::ValueTree::fromXml(*xml);
 
-            if (distortionAmount > 0.0001f)
-            {
-                const float saturated = std::tanh(dry * drive) / normaliser;
-                dry = dry * (1.0f - distortionAmount) + saturated * distortionAmount;
-            }
-
-            const float delayed = delay.popSample(ch);
-            delay.pushSample(ch, dry + delayed * fb);
-            data[i] = (dry * (1.0f - dl) + delayed * dl) * outGain;
+            if (state.isValid())
+                audioProcessor.parameters.replaceState(state);
         }
     }
-
-    juce::dsp::Reverb::Parameters rp;
-    rp.roomSize = 0.62f;
-    rp.damping = 0.42f;
-    rp.wetLevel = rv * 0.45f;
-    rp.dryLevel = 1.0f - rv * 0.25f;
-    rp.width = 1.0f;
-    reverb.setParameters(rp);
-    juce::dsp::AudioBlock<float> block(buffer);
-    juce::dsp::ProcessContextReplacing<float> context(block);
-    reverb.process(context);
 }
 
-void VocalfireAudioProcessor::getStateInformation(juce::MemoryBlock& dest)
+void VocalfireAudioProcessorEditor::paint(juce::Graphics& g)
 {
-    auto state = parameters.copyState();
-    std::unique_ptr<juce::XmlElement> xml(state.createXml());
-    copyXmlToBinary(*xml, dest);
+    g.fillAll(juce::Colour(0xff090610));
+
+    g.setColour(juce::Colour(0xffa855f7));
+    g.setFont(juce::Font(27.0f, juce::Font::bold));
+    g.drawText("VOCALFIRE", 24, 14, 300, 38,
+               juce::Justification::left);
+
+    g.setColour(juce::Colour(0xffc084fc));
+    g.setFont(11.0f);
+    g.drawText("VOCAL PROCESSING SYSTEM // VERSION 2.1",
+               27, 49, 350, 18, juce::Justification::left);
+
+    g.setColour(juce::Colour(0xff39204e));
+    g.drawRoundedRectangle(15.0f, 78.0f,
+                           getWidth() - 30.0f, 105.0f, 10.0f, 1.2f);
+
+    g.drawRoundedRectangle(15.0f, 195.0f,
+                           getWidth() - 30.0f, 205.0f, 10.0f, 1.2f);
+
+    g.setColour(juce::Colour(0xffc084fc));
+    g.setFont(12.0f);
+    g.drawText("ARTIST PRESETS", 28, 84, 180, 20,
+               juce::Justification::left);
+    g.drawText("VOICE FX MODULES", 28, 201, 180, 20,
+               juce::Justification::left);
+    g.drawText("KEY / SCALE", 28, 414, 180, 20,
+               juce::Justification::left);
 }
 
-void VocalfireAudioProcessor::setStateInformation(const void* data, int size)
+void VocalfireAudioProcessorEditor::resized()
 {
-    std::unique_ptr<juce::XmlElement> xml(getXmlFromBinary(data, size));
-    if (xml && xml->hasTagName(parameters.state.getType()))
-        parameters.replaceState(juce::ValueTree::fromXml(*xml));
-}
+    presetBox.setBounds(28, 111, 280, 30);
+    randomButton.setBounds(325, 111, 125, 30);
+    saveButton.setBounds(465, 111, 115, 30);
+    loadButton.setBounds(595, 111, 115, 30);
 
-juce::AudioProcessorEditor* VocalfireAudioProcessor::createEditor()
-{
-    return new VocalfireAudioProcessorEditor(*this);
-}
+    const int sliderWidth = 95;
+    const int sliderHeight = 145;
+    const int startX = 27;
+    const int gap = 9;
+    const int y = 235;
 
-juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
-{
-    return new VocalfireAudioProcessor();
+    inputSlider.setBounds(startX + (sliderWidth + gap) * 0,
+                          y, sliderWidth, sliderHeight);
+    outputSlider.setBounds(startX + (sliderWidth + gap) * 1,
+                           y, sliderWidth, sliderHeight);
+    distortionSlider.setBounds(startX + (sliderWidth + gap) * 2,
+                               y, sliderWidth, sliderHeight);
+    reverbSlider.setBounds(startX + (sliderWidth + gap) * 3,
+                           y, sliderWidth, sliderHeight);
+    delaySlider.setBounds(startX + (sliderWidth + gap) * 4,
+                          y, sliderWidth, sliderHeight);
+    feedbackSlider.setBounds(startX + (sliderWidth + gap) * 5,
+                             y, sliderWidth, sliderHeight);
+    cutoffSlider.setBounds(startX + (sliderWidth + gap) * 6,
+                           y, sliderWidth, sliderHeight);
+
+    keyBox.setBounds(28, 440, 130, 28);
+    scaleBox.setBounds(175, 440, 190, 28);
 }
