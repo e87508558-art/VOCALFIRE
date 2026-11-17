@@ -145,6 +145,11 @@ void VocalfireAudioProcessor::setStateInformation(const void* data, int size)
         parameters.replaceState(juce::ValueTree::fromXml(*xml));
 }
 
+juce::AudioProcessorEditor* VocalfireAudioProcessor::createEditor()
+{
+    return new VocalfireAudioProcessorEditor(*this);
+}
+
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
 {
     return new VocalfireAudioProcessor();
