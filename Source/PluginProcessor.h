@@ -1,45 +1,54 @@
 #pragma once
-#include <JuceHeader.h>
 
-class VocalfireAudioProcessor : public juce::AudioProcessor
+#include <JuceHeader.h>
+#include "PluginProcessor.h"
+
+class VocalfireAudioProcessorEditor : public juce::AudioProcessorEditor
 {
 public:
-    VocalfireAudioProcessor();
-    ~VocalfireAudioProcessor() override = default;
+    explicit VocalfireAudioProcessorEditor(VocalfireAudioProcessor&);
+    ~VocalfireAudioProcessorEditor() override;
 
-    void prepareToPlay(double sampleRate, int samplesPerBlock) override;
-    void releaseResources() override;
-    bool isBusesLayoutSupported(const BusesLayout& layouts) const override;
-    void processBlock(juce::AudioBuffer<float>&, juce::MidiBuffer&) override;
-    juce::AudioProcessorEditor* createEditor() override;
-    bool hasEditor() const override { return true; }
-    const juce::String getName() const override { return "VOCALFIRE"; }
-    bool acceptsMidi() const override { return false; }
-    bool producesMidi() const override { return false; }
-    bool isMidiEffect() const override { return false; }
-    double getTailLengthSeconds() const override { return 4.0; }
-    int getNumPrograms() override { return 1; }
-    int getCurrentProgram() override { return 0; }
-    void setCurrentProgram(int) override {}
-    const juce::String getProgramName(int) override { return {}; }
-    void changeProgramName(int, const juce::String&) override {}
-    void getStateInformation(juce::MemoryBlock&) override;
-    void setStateInformation(const void*, int) override;
-
-    juce::AudioProcessorValueTreeState parameters;
-    float detectedMidiNote() const noexcept { return detectedNote.load(); }
-    float detectedFrequency() const noexcept { return detectedHz.load(); }
+    void paint(juce::Graphics&) override;
+    void resized() override;
 
 private:
-    static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
-    void analysePitch(const juce::AudioBuffer<float>& buffer);
+    VocalfireAudioProcessor& audioProcessor;
 
-    juce::dsp::Reverb reverb;
-    juce::dsp::DelayLine<float, juce::dsp::DelayLineInterpolationTypes::Linear> delay { 192000 };
-    juce::dsp::IIR::Filter<float> lowCutL, lowCutR;
-    juce::AudioBuffer<float> monoAnalysis;
-    std::atomic<float> detectedNote { -1.0f }, detectedHz { 0.0f };
-    double currentSampleRate = 44100.0;
+    juce::ComboBox presetBox;
+    juce::TextButton randomButton { "RANDOM PRESET" };
+    juce::TextButton saveButton { "SAVE PRESET" };
+    juce::TextButton loadButton { "LOAD PRESET" };
 
-    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(VocalfireAudioProcessor)
+    juce::Slider inputSlider, outputSlider;
+    juce::Slider distortionSlider, reverbSlider;
+    juce::Slider delaySlider, feedbackSlider;
+    juce::Slider cutoffSlider;
+
+    juce::ComboBox keyBox, scaleBox;
+
+    using SliderAttachment =
+        juce::AudioProcessorValueTreeState::SliderAttachment;
+
+    using ComboAttachment =
+        juce::AudioProcessorValueTreeState::ComboBoxAttachment;
+
+    std::unique_ptr<SliderAttachment> inputAttachment;
+    std::unique_ptr<SliderAttachment> outputAttachment;
+    std::unique_ptr<SliderAttachment> distortionAttachment;
+    std::unique_ptr<SliderAttachment> reverbAttachment;
+    std::unique_ptr<SliderAttachment> delayAttachment;
+    std::unique_ptr<SliderAttachment> feedbackAttachment;
+    std::unique_ptr<SliderAttachment> cutoffAttachment;
+
+    std::unique_ptr<ComboAttachment> keyAttachment;
+    std::unique_ptr<ComboAttachment> scaleAttachment;
+
+    void applyPreset(int presetIndex);
+    void randomPreset();
+    void savePreset();
+    void loadPreset();
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(
+        VocalfireAudioProcessorEditor)
 };
